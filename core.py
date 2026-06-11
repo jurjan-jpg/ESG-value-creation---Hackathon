@@ -74,9 +74,11 @@ def call_claude(client, model, prompt, max_tokens=8000):
 
 
 # ----------------------------------------------------------------- prompts
+# Templates use plain @@TOKEN@@ placeholders filled via str.replace (NOT % or
+# .format), so literal % and { } in the prompts can never break formatting.
 EXTRACT_PROMPT = """You are an ESG analyst doing the EXTRACT step. Pull ONLY facts that are actually written in the due-diligence (DD) report below. The text is split by slide ("--- Slide N ---"); cite the slide number as the source for every fact.
 
-CRITICAL RULE: never infer, estimate or invent anything. If a data point is NOT in the report, write the EXACT string "%s" as its value and add a short description of it to "data_gaps". Numbers especially must come straight from the report.
+CRITICAL RULE: never infer, estimate or invent anything. If a data point is NOT in the report, write the EXACT string "@@TOCONFIRM@@" as its value and add a short description of it to "data_gaps". Numbers especially must come straight from the report.
 
 Return ONLY valid JSON, EXACTLY this shape:
 {
@@ -84,8 +86,8 @@ Return ONLY valid JSON, EXACTLY this shape:
  "company_profile_sources": {"name":"Slide N","sector":"Slide N","business_model":"Slide N","locations":"Slide N","revenue":"Slide N","employees":"Slide N"},
  "overall": {"abstain_from_deal":"Yes or No","headline":"one-sentence verdict from the report","source":"Slide N"},
  "existing_policies": [{"name":"policy/process name","status":"in place / planned / absent","source":"Slide N"}],
- "key_metrics": [{"name":"metric","value":"as stated","benchmark":"vs peer/sector if given else %s","source":"Slide N"}],
- "themes": [{"code":"E1","name":"theme name","pillar":"E/S/G","maturity":"rating word from report or %s",
+ "key_metrics": [{"name":"metric","value":"as stated","benchmark":"vs peer/sector if given else @@TOCONFIRM@@","source":"Slide N"}],
+ "themes": [{"code":"E1","name":"theme name","pillar":"E/S/G","maturity":"rating word from report or @@TOCONFIRM@@",
              "finding":"2-3 sentences of the assessed risk/gap","recommended_actions":["action as stated in DD"],
              "investment_eur": <theme short-term investment in EUR or null>,
              "value_creation_eur": <theme annual value-creation opp in EUR or null>,"source":"Slide N"}],
@@ -96,14 +98,14 @@ Return ONLY valid JSON, EXACTLY this shape:
 Convert 'k'->thousands, 'm'/'M'->millions. Include every material theme.
 
 DD REPORT:
-%s
-""" % (TOCONFIRM, TOCONFIRM, TOCONFIRM, "%s")
+@@REPORT@@
+"""
 
 ADVISE_PROMPT = """You are a private equity value-creation expert doing the ADVISE step. Using ONLY the extracted findings below as the factual base, design an EXTENSIVE, DETAILED 100-day post-acquisition ESG plan. This is your recommendation layer - go well beyond restating the DD: add concrete activities, owners, milestones and recommended targets that a portfolio operating team could execute.
 
 RULES:
 - Everything here is a RECOMMENDATION built on the facts; do not contradict the facts.
-- For any KPI baseline that is not in the findings, write the EXACT string "%s" - never invent a baseline number. Targets are recommendations and may be expressed as relative goals (e.g. "-20%% vs baseline").
+- For any KPI baseline that is not in the findings, write the EXACT string "@@TOCONFIRM@@" - never invent a baseline number. Targets are recommendations and may be expressed as relative goals (e.g. "20 percent below baseline").
 - Reference the source finding for each initiative via its theme code / slide.
 - Create MULTIPLE initiatives per theme where useful, and give each 2-4 concrete activities.
 
@@ -121,21 +123,33 @@ Return ONLY valid JSON, EXACTLY:
     "activities":["concrete step 1","step 2","step 3"],
     "milestone":"what 'done' looks like by the end of the phase",
     "owner_role":"ESG Lead",
-    "recommended_kpi":{"name":"...","baseline":"value from findings or %s","target":"recommended target"},
+    "recommended_kpi":{"name":"...","baseline":"value from findings or @@TOCONFIRM@@","target":"recommended target"},
     "scores":{"risk_reduction":4,"ebitda_impact":3,"revenue_growth":1,"financing_benefit":2,"operational_efficiency":4,"implementation_feasibility":5},
     "phase":"0-30","dependencies":[],"source":"E1 / Slide N","rationale":"one sentence"}
  ]
 }
 
 EXTRACTED FINDINGS:
-%s
-""" % (TOCONFIRM, TOCONFIRM, "%s")
+@@FINDINGS@@
+"""
 
 BOARD_PROMPT = """Prepare a concise, commercially framed board update on the 100-day ESG plan below. Return ONLY valid JSON:
 {"executive_summary":"3-4 sentences","phases":[{"phase":"0-30","status":"On track/At risk/Complete","highlights":["..."]},{"phase":"30-60","status":"...","highlights":["..."]},{"phase":"60-100","status":"...","highlights":["..."]}],"top_priorities":["..."],"risks_and_asks":["..."]}
 PLAN + TRACKING + METRICS:
-%s
+@@PLAN@@
 """
+
+
+def extract_prompt(report_text):
+    return EXTRACT_PROMPT.replace("@@TOCONFIRM@@", TOCONFIRM).replace("@@REPORT@@", report_text)
+
+
+def advise_prompt(findings_json):
+    return ADVISE_PROMPT.replace("@@TOCONFIRM@@", TOCONFIRM).replace("@@FINDINGS@@", findings_json)
+
+
+def board_prompt(plan_json):
+    return BOARD_PROMPT.replace("@@PLAN@@", plan_json)
 
 
 # ------------------------------------------------------------- scoring / math
