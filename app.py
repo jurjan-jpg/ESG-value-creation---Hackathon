@@ -153,9 +153,14 @@ if ss.initiatives:
 
     # downloadable standard JSON
     plan_obj = core.build_plan_object(ss.findings, inits, weights, ss.tracking)
-    st.download_button("Download plan as JSON",
-                       data=json.dumps(plan_obj, indent=2),
-                       file_name="100_day_esg_plan.json", mime="application/json")
+    dl1, dl2 = st.columns(2)
+    dl1.download_button("Download branded 100-day plan (PowerPoint)",
+                        data=core.branded_plan_pptx(plan_obj),
+                        file_name="100_day_esg_plan.pptx",
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+    dl2.download_button("Download plan as data (JSON)",
+                        data=json.dumps(plan_obj, indent=2),
+                        file_name="100_day_esg_plan.json", mime="application/json")
 
 # ---------------------------------------------------------------- step 4
 if ss.initiatives:
