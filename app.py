@@ -55,7 +55,7 @@ if st.button("Extract facts", type="primary"):
         with st.spinner("Reading the report and pulling facts (with sources)..."):
             try:
                 text = core.extract_pptx_text(uploaded.read())
-                ss.extract = core.parse_json(core.call_claude(client, model, core.EXTRACT_PROMPT % text[:60000]))
+                ss.extract = core.parse_json(core.call_claude(client, model, core.extract_prompt(text[:60000])))
                 ss.advice = None
                 ss.board = None
                 st.success("Facts extracted.")
@@ -87,7 +87,7 @@ if ss.extract:
             with st.spinner("Designing the detailed roadmap, targets and value story..."):
                 try:
                     ss.advice = core.parse_json(core.call_claude(
-                        client, model, core.ADVISE_PROMPT % json.dumps(ss.extract), max_tokens=8000))
+                        client, model, core.advise_prompt(json.dumps(ss.extract)), max_tokens=8000))
                     ss.tracking = {i["id"]: False for i in ss.advice.get("initiatives", [])}
                     ss.board = None
                     st.success("Plan built. Adjust the weight sliders on the left to re-prioritise.")
@@ -149,7 +149,7 @@ if ss.advice:
                                "initiatives": [{"title": i.get("title"), "phase": i.get("phase"),
                                                 "status": "complete" if ss.tracking.get(i["id"]) else "open"}
                                                for i in ss.advice.get("initiatives", [])]}
-                    ss.board = core.parse_json(core.call_claude(client, model, core.BOARD_PROMPT % json.dumps(payload)))
+                    ss.board = core.parse_json(core.call_claude(client, model, core.board_prompt(json.dumps(payload))))
                     st.success("Board update ready.")
                 except Exception as e:
                     st.error("Board update failed: %s" % e)
