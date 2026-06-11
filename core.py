@@ -60,8 +60,16 @@ def parse_json(text):
 
 
 def call_claude(client, model, prompt, max_tokens=8000):
-    msg = client.messages.create(model=model, max_tokens=max_tokens, temperature=0,
-                                 messages=[{"role": "user", "content": prompt}])
+    kwargs = dict(model=model, max_tokens=max_tokens,
+                  messages=[{"role": "user", "content": prompt}])
+    try:
+        # temperature=0 gives determinism on models that still support it
+        msg = client.messages.create(temperature=0, **kwargs)
+    except Exception as e:
+        if "temperature" in str(e).lower():
+            msg = client.messages.create(**kwargs)  # newer models: omit it
+        else:
+            raise
     return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
 
 
