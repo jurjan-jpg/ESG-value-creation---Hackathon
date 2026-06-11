@@ -1,174 +1,136 @@
+"""Core logic for the ESG Value Creation Module. Two stages:
+   EXTRACT  -> pulls facts from the DD, each with a source; flags gaps.
+   ADVISE   -> builds the detailed 100-day roadmap on top of those facts.
 """
-Core logic for the ESG Value Creation Module.
-Kept separate from the Streamlit UI so it can be tested on its own.
-"""
-import json
-import re
+import os, json, re
 from io import BytesIO
 from datetime import date
 
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE
 
-# The six prioritisation dimensions (key, label)
+TOCONFIRM = "[TO CONFIRM \u2014 not in DD]"
+
 DIMENSIONS = [
-    ("risk_reduction", "Risk reduction"),
-    ("ebitda_impact", "EBITDA impact"),
-    ("revenue_growth", "Revenue growth"),
-    ("financing_benefit", "Financing benefits"),
-    ("operational_efficiency", "Operational efficiency"),
-    ("implementation_feasibility", "Implementation feasibility"),
+    ("risk_reduction", "Risk reduction"), ("ebitda_impact", "EBITDA impact"),
+    ("revenue_growth", "Revenue growth"), ("financing_benefit", "Financing benefits"),
+    ("operational_efficiency", "Operational efficiency"), ("implementation_feasibility", "Implementation feasibility"),
 ]
+DEFAULT_WEIGHTS = {"risk_reduction": 25, "ebitda_impact": 20, "revenue_growth": 10,
+                   "financing_benefit": 10, "operational_efficiency": 15, "implementation_feasibility": 20}
+PHASES = [("0-30", "Day 0-30 \u00b7 Stabilise & assign ownership"),
+          ("30-60", "Day 30-60 \u00b7 Implement quick wins"),
+          ("60-100", "Day 60-100 \u00b7 Embed KPIs & board reporting")]
 
-DEFAULT_WEIGHTS = {
-    "risk_reduction": 25,
-    "ebitda_impact": 20,
-    "revenue_growth": 10,
-    "financing_benefit": 10,
-    "operational_efficiency": 15,
-    "implementation_feasibility": 20,
-}
-
-PHASES = [
-    ("0-30", "Day 0-30 · Stabilise & assign ownership"),
-    ("30-60", "Day 30-60 · Implement quick wins"),
-    ("60-100", "Day 60-100 · Embed KPIs & prepare board reporting"),
-]
+# Holtara brand
+NAVY = RGBColor(0x2C, 0x3C, 0x7E); ORANGE = RGBColor(0xE8, 0x77, 0x22)
+GREY = RGBColor(0x57, 0x57, 0x56); TEAL = RGBColor(0x6F, 0xA4, 0x91)
+TEXT = RGBColor(0x1E, 0x1E, 0x1E); WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+REDFLAG = RGBColor(0xC0, 0x39, 0x2B); LIGHT = RGBColor(0xF4, 0xF4, 0xF2)
+FONT = "Open Sans"
+PHASE_COLOR = {"0-30": NAVY, "30-60": TEAL, "60-100": ORANGE}
+PILLAR_COLOR = {"E": TEAL, "S": NAVY, "G": ORANGE}
+LOGO_PATH = "holtara_logo.png"
 
 
 # ---------------------------------------------------------------- extraction
 def extract_pptx_text(file_bytes):
-    """Pull all readable text and tables out of a .pptx file."""
-    prs = Presentation(BytesIO(file_bytes))
-    chunks = []
+    prs = Presentation(BytesIO(file_bytes)); chunks = []
     for i, slide in enumerate(prs.slides):
         parts = []
         for shape in slide.shapes:
             if shape.has_text_frame and shape.text_frame.text.strip():
                 parts.append(shape.text_frame.text.strip())
             if shape.has_table:
-                rows = []
-                for r in shape.table.rows:
-                    rows.append(" | ".join(c.text.strip() for c in r.cells))
-                parts.append("TABLE:\n" + "\n".join(rows))
+                parts.append("TABLE:\n" + "\n".join(
+                    " | ".join(c.text.strip() for c in r.cells) for r in shape.table.rows))
         if parts:
             chunks.append("--- Slide %d ---\n%s" % (i + 1, "\n".join(parts)))
     return "\n\n".join(chunks)
 
 
 def parse_json(text):
-    """Robustly parse JSON that may be wrapped in ``` fences or prose."""
-    text = text.strip()
-    text = re.sub(r"^```[a-zA-Z]*", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end != -1:
-        text = text[start:end + 1]
+    text = re.sub(r"```$", "", re.sub(r"^```[a-zA-Z]*", "", text.strip()).strip()).strip()
+    a, b = text.find("{"), text.rfind("}")
+    if a != -1 and b != -1:
+        text = text[a:b + 1]
     return json.loads(text)
 
 
 def call_claude(client, model, prompt, max_tokens=8000):
-    msg = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    msg = client.messages.create(model=model, max_tokens=max_tokens, temperature=0,
+                                 messages=[{"role": "user", "content": prompt}])
     return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
 
 
 # ----------------------------------------------------------------- prompts
-EXTRACTION_PROMPT = """You are an ESG analyst. Below is the full text extracted from an ESG due diligence (DD) report. Extract a structured summary of the material ESG themes and their findings.
+EXTRACT_PROMPT = """You are an ESG analyst doing the EXTRACT step. Pull ONLY facts that are actually written in the due-diligence (DD) report below. The text is split by slide ("--- Slide N ---"); cite the slide number as the source for every fact.
 
-Return ONLY valid JSON (no markdown, no commentary), in EXACTLY this shape:
+CRITICAL RULE: never infer, estimate or invent anything. If a data point is NOT in the report, write the EXACT string "%s" as its value and add a short description of it to "data_gaps". Numbers especially must come straight from the report.
+
+Return ONLY valid JSON, EXACTLY this shape:
 {
- "company": {"name": "...", "sector": "...", "summary": "one sentence about the company"},
- "overall": {"abstain_from_deal": "Yes or No", "headline": "one sentence overall ESG verdict"},
- "themes": [
-   {"code": "E1", "name": "theme name", "pillar": "E or S or G",
-    "current_maturity": "the maturity rating word used in the report, or null",
-    "key_findings": "2-3 sentences on the key risks/gaps for this theme",
-    "recommended_actions": ["short concrete action", "another action"],
-    "investment_eur": 100000,
-    "value_creation_eur": 400000,
-    "suggested_kpis": ["kpi name", "kpi name"]}
- ]
+ "company_profile": {"name":"...","sector":"...","business_model":"...","locations":"...","revenue":"...","employees":"..."},
+ "company_profile_sources": {"name":"Slide N","sector":"Slide N","business_model":"Slide N","locations":"Slide N","revenue":"Slide N","employees":"Slide N"},
+ "overall": {"abstain_from_deal":"Yes or No","headline":"one-sentence verdict from the report","source":"Slide N"},
+ "existing_policies": [{"name":"policy/process name","status":"in place / planned / absent","source":"Slide N"}],
+ "key_metrics": [{"name":"metric","value":"as stated","benchmark":"vs peer/sector if given else %s","source":"Slide N"}],
+ "themes": [{"code":"E1","name":"theme name","pillar":"E/S/G","maturity":"rating word from report or %s",
+             "finding":"2-3 sentences of the assessed risk/gap","recommended_actions":["action as stated in DD"],
+             "investment_eur": <theme short-term investment in EUR or null>,
+             "value_creation_eur": <theme annual value-creation opp in EUR or null>,"source":"Slide N"}],
+ "totals": {"investment_eur": <report's STATED total investment EUR or null>,
+            "value_creation_eur": <report's STATED total value-creation EUR or null>, "source":"Slide N"},
+ "data_gaps": ["each notable fact NOT found in the DD"]
 }
+Convert 'k'->thousands, 'm'/'M'->millions. Include every material theme.
 
-Rules:
-- Use the report's own euro figures where given. Convert 'k' to thousands and 'm'/'M' to millions (e.g. "€100k" -> 100000, "€1.2M" -> 1200000).
-- If a euro number is missing, "To be done", or unknown, use null.
-- pillar: E = environmental, S = social, G = governance.
-- Include every material theme you can find.
-
-REPORT TEXT:
+DD REPORT:
 %s
-"""
+""" % (TOCONFIRM, TOCONFIRM, TOCONFIRM, "%s")
 
-PLANNER_PROMPT = """You are a private equity value-creation expert. Turn these ESG due-diligence findings into a prioritised 100-day post-acquisition action plan.
+ADVISE_PROMPT = """You are a private equity value-creation expert doing the ADVISE step. Using ONLY the extracted findings below as the factual base, design an EXTENSIVE, DETAILED 100-day post-acquisition ESG plan. This is your recommendation layer - go well beyond restating the DD: add concrete activities, owners, milestones and recommended targets that a portfolio operating team could execute.
 
-For EACH recommended action across the themes, create one initiative. Score each initiative from 1 (low) to 5 (high) on these six dimensions:
-- risk_reduction: how much it reduces ESG / regulatory / business risk
-- ebitda_impact: effect on EBITDA via cost savings or margin
-- revenue_growth: effect on revenue or commercial win-rate
-- financing_benefit: effect on financing terms (sustainability-linked loan margins, refinancing, investor appeal)
-- operational_efficiency: process / operational improvement
-- implementation_feasibility: how easy and fast it is to do (5 = very easy / quick)
+RULES:
+- Everything here is a RECOMMENDATION built on the facts; do not contradict the facts.
+- For any KPI baseline that is not in the findings, write the EXACT string "%s" - never invent a baseline number. Targets are recommendations and may be expressed as relative goals (e.g. "-20%% vs baseline").
+- Reference the source finding for each initiative via its theme code / slide.
+- Create MULTIPLE initiatives per theme where useful, and give each 2-4 concrete activities.
 
-Assign each initiative to exactly ONE phase:
-- "0-30"  = Day 0-30, Stabilise & assign ownership (foundational items, governance, baselines, highest-risk fixes)
-- "30-60" = Day 30-60, Implement quick wins (high feasibility, visible impact)
-- "60-100" = Day 60-100, Embed KPIs & prepare board reporting (targets, dashboards, reporting cadence)
-Use dependency logic: anything that needs a baseline, an owner, or another initiative done first should go in a later phase.
+Assign each initiative to ONE phase: "0-30" (stabilise & assign ownership), "30-60" (quick wins), "60-100" (embed KPIs & board reporting). Use dependency logic.
+Score each 1-5 on: risk_reduction, ebitda_impact, revenue_growth, financing_benefit, operational_efficiency, implementation_feasibility.
+Owner roles: "CFO","Head of Operations","Head of HR","Head of IT / Security","ESG Lead","General Counsel". Do NOT include euro figures (handled separately).
 
-Carry the investment_eur and value_creation_eur from the theme. If a theme has several initiatives, put the euro figures on the single most relevant initiative and use null for the others, so the totals are NOT inflated.
-Give each initiative a generic owner_role such as: "CFO", "Head of Operations", "Head of HR", "Head of IT / Security", "ESG Lead", "General Counsel".
-
-Return ONLY valid JSON (no markdown), in EXACTLY this shape:
+Return ONLY valid JSON, EXACTLY:
 {
+ "value_story": "3-4 sentence commercial narrative: how this plan protects and creates value (recommendation)",
+ "assumptions": ["key assumptions behind the recommendations"],
  "initiatives": [
-   {"id": "E1-01", "theme": "E1", "theme_name": "...", "pillar": "E",
-    "title": "short imperative title", "description": "1-2 sentences",
-    "scores": {"risk_reduction": 4, "ebitda_impact": 3, "revenue_growth": 1,
-               "financing_benefit": 2, "operational_efficiency": 4, "implementation_feasibility": 5},
-    "phase": "0-30", "owner_role": "ESG Lead",
-    "investment_eur": 20000, "value_creation_eur": 80000,
-    "kpis": [{"name": "...", "target": "..."}],
-    "dependencies": [], "rationale": "one sentence on the scoring and phase choice"}
+   {"id":"E1-01","theme":"E1","theme_name":"...","pillar":"E","title":"imperative title",
+    "objective":"what this achieves and why it matters commercially",
+    "activities":["concrete step 1","step 2","step 3"],
+    "milestone":"what 'done' looks like by the end of the phase",
+    "owner_role":"ESG Lead",
+    "recommended_kpi":{"name":"...","baseline":"value from findings or %s","target":"recommended target"},
+    "scores":{"risk_reduction":4,"ebitda_impact":3,"revenue_growth":1,"financing_benefit":2,"operational_efficiency":4,"implementation_feasibility":5},
+    "phase":"0-30","dependencies":[],"source":"E1 / Slide N","rationale":"one sentence"}
  ]
 }
 
-FINDINGS JSON:
+EXTRACTED FINDINGS:
 %s
-"""
+""" % (TOCONFIRM, TOCONFIRM, "%s")
 
-BOARD_PROMPT = """You are preparing a board update on a 100-day ESG value-creation plan for a private equity owner. Below is the plan with current tracking status and pre-computed metrics. Write a concise, commercially framed update.
-
-Return ONLY valid JSON (no markdown), in EXACTLY this shape:
-{
- "executive_summary": "3-4 sentences, commercial framing: value at stake, ROI, risk reduced, momentum",
- "phases": [
-   {"phase": "0-30", "status": "On track / At risk / Complete", "highlights": ["...", "..."]},
-   {"phase": "30-60", "status": "...", "highlights": ["..."]},
-   {"phase": "60-100", "status": "...", "highlights": ["..."]}
- ],
- "top_priorities": ["...", "...", "..."],
- "risks_and_asks": ["...", "..."]
-}
-
-PLAN + TRACKING + METRICS JSON:
+BOARD_PROMPT = """Prepare a concise, commercially framed board update on the 100-day ESG plan below. Return ONLY valid JSON:
+{"executive_summary":"3-4 sentences","phases":[{"phase":"0-30","status":"On track/At risk/Complete","highlights":["..."]},{"phase":"30-60","status":"...","highlights":["..."]},{"phase":"60-100","status":"...","highlights":["..."]}],"top_priorities":["..."],"risks_and_asks":["..."]}
+PLAN + TRACKING + METRICS:
 %s
 """
 
 
 # ------------------------------------------------------------- scoring / math
-def compute_composite(initiative, weights):
-    s = initiative.get("scores", {})
-    total_w = sum(weights.values()) or 1
-    val = sum(float(s.get(k, 0)) * weights[k] for k in weights) / total_w
-    return round(val, 2)
-
-
 def _num(x):
     try:
         return float(x)
@@ -176,271 +138,353 @@ def _num(x):
         return 0.0
 
 
-def compute_metrics(initiatives, tracking):
-    total_value = sum(_num(i.get("value_creation_eur")) for i in initiatives)
-    total_invest = sum(_num(i.get("investment_eur")) for i in initiatives)
-    roi = (total_value / total_invest) if total_invest else 0.0
-    done = sum(1 for i in initiatives if tracking.get(i["id"]))
-    n = len(initiatives)
-    return {
-        "total_value_creation_eur": total_value,
-        "total_investment_eur": total_invest,
-        "roi_multiple": round(roi, 1),
-        "initiatives_total": n,
-        "initiatives_complete": done,
-        "percent_complete": round(100 * done / n) if n else 0,
-    }
+def compute_composite(i, w):
+    s = i.get("scores", {}); tw = sum(w.values()) or 1
+    return round(sum(_num(s.get(k)) * w[k] for k in w) / tw, 2)
 
 
-def build_plan_object(findings, initiatives, weights, tracking):
-    """Assemble the full, reusable plan JSON (the standard output)."""
-    ranked = sorted(initiatives, key=lambda i: compute_composite(i, weights), reverse=True)
-    for rank, i in enumerate(ranked, 1):
-        i["composite_score"] = compute_composite(i, weights)
-        i["priority_rank"] = rank
+def attach_theme_money(extract, initiatives):
+    money = {t.get("code"): (t.get("investment_eur"), t.get("value_creation_eur"))
+             for t in extract.get("themes", [])}
+    by = {}
+    for i in sorted(initiatives, key=lambda x: x.get("id", "")):
+        by.setdefault(i.get("theme"), []).append(i)
+    for theme, items in by.items():
+        inv, val = money.get(theme, (None, None))
+        for idx, it in enumerate(items):
+            it["investment_eur"] = inv if idx == 0 else None
+            it["value_creation_eur"] = val if idx == 0 else None
+    return initiatives
+
+
+def compute_metrics(extract, initiatives, tracking):
+    totals = extract.get("totals") or {}; themes = extract.get("themes", [])
+    tv = _num(totals.get("value_creation_eur")) or sum(_num(t.get("value_creation_eur")) for t in themes)
+    ti = _num(totals.get("investment_eur")) or sum(_num(t.get("investment_eur")) for t in themes)
+    roi = (tv / ti) if ti else 0.0
+    done = sum(1 for i in initiatives if tracking.get(i["id"])); n = len(initiatives)
+    return {"total_value_creation_eur": tv, "total_investment_eur": ti, "roi_multiple": round(roi, 1),
+            "initiatives_total": n, "initiatives_complete": done,
+            "percent_complete": round(100 * done / n) if n else 0}
+
+
+def build_plan_object(extract, advice, weights, tracking):
+    inits = advice.get("initiatives", [])
+    attach_theme_money(extract, inits)
+    ranked = sorted(inits, key=lambda i: compute_composite(i, weights), reverse=True)
+    for r, i in enumerate(ranked, 1):
+        i["composite_score"] = compute_composite(i, weights); i["priority_rank"] = r
         i["status"] = "complete" if tracking.get(i["id"]) else "open"
-    phases = {}
-    for key, label in PHASES:
-        phases[key] = {
-            "label": label,
-            "initiative_ids": [i["id"] for i in ranked if i.get("phase") == key],
-        }
+    cp = extract.get("company_profile", {})
     return {
-        "company": findings.get("company", {}),
-        "overall": findings.get("overall", {}),
-        "generated_on": str(date.today()),
-        "weights": weights,
-        "metrics": compute_metrics(initiatives, tracking),
-        "phases": phases,
+        "company": {"name": cp.get("name", "Company")},
+        "themes": extract.get("themes", []),
+        "company_profile": cp, "company_profile_sources": extract.get("company_profile_sources", {}),
+        "overall": extract.get("overall", {}), "existing_policies": extract.get("existing_policies", []),
+        "key_metrics": extract.get("key_metrics", []), "data_gaps": extract.get("data_gaps", []),
+        "value_story": advice.get("value_story", ""), "assumptions": advice.get("assumptions", []),
+        "generated_on": str(date.today()), "weights": weights,
+        "metrics": compute_metrics(extract, inits, tracking),
+        "phases": {k: {"label": l, "initiative_ids": [i["id"] for i in ranked if i.get("phase") == k]}
+                   for k, l in PHASES},
         "initiatives": ranked,
     }
 
 
-# ----------------------------------------------------------- board rendering
-def board_markdown(company_name, narrative, metrics):
-    eur = lambda v: "EUR {:,.0f}".format(v)
-    lines = []
-    lines.append("# 100-Day ESG Value Creation Plan - Board Update")
-    lines.append("**Company:** %s  |  **Date:** %s" % (company_name, date.today()))
-    lines.append("")
-    lines.append("## Executive summary")
-    lines.append(narrative.get("executive_summary", ""))
-    lines.append("")
-    lines.append("## Key metrics")
-    lines.append("- Total annual value creation opportunity: **%s**" % eur(metrics["total_value_creation_eur"]))
-    lines.append("- Total implementation investment: **%s**" % eur(metrics["total_investment_eur"]))
-    lines.append("- Return on investment: **%sx**" % metrics["roi_multiple"])
-    lines.append("- Initiatives: **%d total, %d complete (%d%%)**" % (
-        metrics["initiatives_total"], metrics["initiatives_complete"], metrics["percent_complete"]))
-    lines.append("")
-    lines.append("## Progress by phase")
-    for ph in narrative.get("phases", []):
-        lines.append("**%s - %s**" % (ph.get("phase", ""), ph.get("status", "")))
-        for h in ph.get("highlights", []):
-            lines.append("- %s" % h)
-        lines.append("")
-    lines.append("## Top priorities")
-    for p in narrative.get("top_priorities", []):
-        lines.append("- %s" % p)
-    lines.append("")
-    lines.append("## Risks & asks")
-    for r in narrative.get("risks_and_asks", []):
-        lines.append("- %s" % r)
-    return "\n".join(lines)
-
-
-# ----------------------------------------------------------- Holtara branding
-# Colours + font taken from the Holtara DD template. To use exact brand hex
-# codes, just change these four lines.
-HOLTARA_NAVY = RGBColor(0x0E, 0x28, 0x41)
-HOLTARA_BLUE = RGBColor(0x15, 0x60, 0x82)
-HOLTARA_ORANGE = RGBColor(0xE9, 0x71, 0x32)
-HOLTARA_GREY = RGBColor(0x55, 0x55, 0x55)
-HOLTARA_FONT = "Aptos"
-PILLAR_COLOR = {"E": RGBColor(0x19, 0x6B, 0x24), "S": HOLTARA_BLUE, "G": RGBColor(0xA0, 0x2B, 0x93)}
-
-
-def _txt(frame, text, size, *, bold=False, color=None, font=HOLTARA_FONT):
-    frame.text = text
-    r = frame.paragraphs[0].runs[0]
-    r.font.size = Pt(size)
-    r.font.bold = bold
-    r.font.name = font
+# --------------------------------------------------------- pptx helpers
+def _set(run, size, bold, color, italic=False):
+    run.font.size = Pt(size); run.font.bold = bold; run.font.italic = italic
+    run.font.name = FONT
     if color is not None:
-        r.font.color.rgb = color
-    return frame
+        run.font.color.rgb = color
 
 
-def _add_line(frame, text, size, *, bold=False, color=None, font=HOLTARA_FONT):
-    p = frame.add_paragraph()
-    p.text = text
-    r = p.runs[0]
-    r.font.size = Pt(size)
-    r.font.bold = bold
-    r.font.name = font
-    if color is not None:
-        r.font.color.rgb = color
-    return p
+def _box(slide, x, y, w, h):
+    tf = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h)).text_frame
+    tf.word_wrap = True
+    return tf
 
 
-def _header_bar(slide, prs, title):
-    """Navy header bar with white title + orange tagline."""
-    bar = slide.shapes.add_shape(1, Inches(0), Inches(0), prs.slide_width, Inches(1.0))
-    bar.fill.solid()
-    bar.fill.fore_color.rgb = HOLTARA_NAVY
-    bar.line.fill.background()
-    tf = bar.text_frame
-    tf.margin_left = Inches(0.6)
-    _txt(tf, title, 26, bold=True, color=RGBColor(0xFF, 0xFF, 0xFF))
+def _first(tf, t, s, bold=False, color=TEXT, italic=False):
+    tf.text = t; _set(tf.paragraphs[0].runs[0], s, bold, color, italic); return tf.paragraphs[0]
 
 
-def branded_plan_pptx(plan):
-    """Render the full 100-day plan as a polished, Holtara-branded deck."""
-    prs = Presentation()
-    prs.slide_width = Inches(13.33)
-    prs.slide_height = Inches(7.5)
+def _line(tf, t, s, bold=False, color=TEXT, italic=False, before=0, lvl=0):
+    p = tf.add_paragraph(); p.text = t; p.space_before = Pt(before); p.level = lvl
+    col = REDFLAG if (isinstance(t, str) and "TO CONFIRM" in t) else color
+    _set(p.runs[0], s, bold, col, italic); return p
+
+
+def _rect(slide, x, y, w, h, color):
+    sh = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+    sh.fill.solid(); sh.fill.fore_color.rgb = color; sh.line.fill.background(); return sh
+
+
+def _logo(slide):
+    if os.path.exists(LOGO_PATH):
+        try:
+            slide.shapes.add_picture(LOGO_PATH, Inches(11.0), Inches(0.35), width=Inches(1.9))
+        except Exception:
+            pass
+
+
+def _footer(slide, note=""):
+    tf = _box(slide, 0.5, 7.12, 12.3, 0.3)
+    txt = "Strictly Private & Confidential. Copyright \u00a9 %d Holtara" % date.today().year
+    if note:
+        txt = note + "   |   " + txt
+    _first(tf, txt, 8, color=GREY)
+
+
+def _content(prs, title, sub=""):
+    s = prs.slides.add_slide(prs.slide_layouts[6])
+    _rect(s, 0.0, 0.0, 13.33, 0.95, NAVY)
+    h = _box(s, 0.5, 0.12, 10.3, 0.8)
+    _first(h, title, 22, bold=True, color=WHITE)
+    if sub:
+        _line(h, sub, 11, color=RGBColor(0xCF, 0xD6, 0xE6))
+    _logo(s)
+    return s
+
+
+# ----------------------------------------------------------- DETAILED deck
+def detailed_plan_pptx(plan):
+    prs = Presentation(); prs.slide_width = Inches(13.33); prs.slide_height = Inches(7.5)
     blank = prs.slide_layouts[6]
     eur = lambda v: "EUR {:,.0f}".format(_num(v))
-    company = plan.get("company", {}).get("name", "Company")
-    metrics = plan.get("metrics", {})
+    cp = plan.get("company_profile", {}); cps = plan.get("company_profile_sources", {})
+    company = plan.get("company", {}).get("name", "Company"); m = plan.get("metrics", {})
 
-    # ---- Title slide
+    # 1 Title
     s = prs.slides.add_slide(blank)
-    band = s.shapes.add_shape(1, Inches(0), Inches(2.4), prs.slide_width, Inches(2.7))
-    band.fill.solid(); band.fill.fore_color.rgb = HOLTARA_NAVY; band.line.fill.background()
-    box = s.shapes.add_textbox(Inches(0.7), Inches(2.7), Inches(12), Inches(2.0)).text_frame
-    _txt(box, "100-Day ESG Value Creation Plan", 40, bold=True, color=RGBColor(0xFF, 0xFF, 0xFF))
-    _add_line(box, company, 22, color=HOLTARA_ORANGE)
-    _add_line(box, "Driving positive change", 14, color=RGBColor(0xE8, 0xE8, 0xE8))
-    foot = s.shapes.add_textbox(Inches(0.7), Inches(6.9), Inches(12), Inches(0.4)).text_frame
-    _txt(foot, "Holtara  |  %s  |  Strictly private & confidential" % date.today(), 11, color=HOLTARA_GREY)
+    _rect(s, 0, 2.4, 13.33, 2.7, NAVY)
+    t = _box(s, 0.7, 2.7, 11, 2.0)
+    _first(t, "100-Day ESG Value Creation Plan", 38, bold=True, color=WHITE)
+    _line(t, "Driving positive change", 14, color=RGBColor(0xCF, 0xD6, 0xE6), italic=True)
+    _line(t, company, 20, color=ORANGE)
+    _logo(s); _footer(s)
 
-    # ---- Summary slide with metric cards
-    s = prs.slides.add_slide(blank)
-    _header_bar(s, prs, "Executive summary")
-    cards = [
-        ("Annual value creation", eur(metrics.get("total_value_creation_eur", 0))),
-        ("Investment", eur(metrics.get("total_investment_eur", 0))),
-        ("Return on investment", "%sx" % metrics.get("roi_multiple", 0)),
-        ("Initiatives", str(metrics.get("initiatives_total", 0))),
-    ]
-    x = 0.6
-    for label, value in cards:
-        card = s.shapes.add_shape(1, Inches(x), Inches(1.4), Inches(2.95), Inches(1.5))
-        card.fill.solid(); card.fill.fore_color.rgb = RGBColor(0xF2, 0xF5, 0xF8)
-        card.line.color.rgb = HOLTARA_BLUE; card.line.width = Pt(1)
-        tf = card.text_frame; tf.margin_left = Inches(0.2); tf.margin_top = Inches(0.2)
-        _txt(tf, value, 24, bold=True, color=HOLTARA_NAVY)
-        _add_line(tf, label, 12, color=HOLTARA_GREY)
-        x += 3.07
-    verdict = plan.get("overall", {}).get("headline", "")
-    vb = s.shapes.add_textbox(Inches(0.6), Inches(3.4), Inches(12.1), Inches(3.4)).text_frame
-    vb.word_wrap = True
-    _txt(vb, "Overall ESG verdict", 16, bold=True, color=HOLTARA_NAVY)
-    _add_line(vb, verdict, 14, color=RGBColor(0x33, 0x33, 0x33))
+    # 2 Executive summary
+    s = _content(prs, "Executive summary", "The value story (recommendation) and headline economics")
+    cards = [("Annual value creation", eur(m.get("total_value_creation_eur", 0)), ORANGE),
+             ("Investment", eur(m.get("total_investment_eur", 0)), NAVY),
+             ("Return on investment", "%sx" % m.get("roi_multiple", 0), ORANGE),
+             ("Initiatives", str(m.get("initiatives_total", 0)), NAVY)]
+    x = 0.5
+    for label, val, col in cards:
+        c = _box(s, x, 1.2, 3.05, 1.0); _first(c, val, 23, bold=True, color=col)
+        _line(c, label, 10.5, color=GREY); x += 3.07
+    vs = _box(s, 0.5, 2.45, 12.3, 1.7)
+    _first(vs, "Value story", 13, bold=True, color=NAVY)
+    _line(vs, plan.get("value_story", ""), 12, color=TEXT)
+    ov = plan.get("overall", {})
+    vd = _box(s, 0.5, 4.2, 12.3, 1.6)
+    _first(vd, "Overall ESG verdict (from DD)", 13, bold=True, color=NAVY)
+    _line(vd, "%s   (source: %s)" % (ov.get("headline", TOCONFIRM), ov.get("source", "n/a")), 12, color=TEXT)
+    _footer(s)
 
-    # ---- One slide per phase
+    # 3 Baseline facts (EXTRACT, traceable)
+    s = _content(prs, "Company & ESG baseline", "Facts extracted from the DD \u2014 source shown in brackets")
+    left = _box(s, 0.5, 1.2, 6.2, 5.7)
+    _first(left, "Company profile", 13, bold=True, color=ORANGE)
+    for k in ["sector", "business_model", "locations", "revenue", "employees"]:
+        _line(left, "%s: %s" % (k.replace("_", " ").title(), cp.get(k, TOCONFIRM)), 11, before=3)
+        _line(left, "source: %s" % cps.get(k, "n/a"), 8.5, color=GREY)
+    _line(left, "Existing policies & processes", 13, bold=True, color=ORANGE, before=10)
+    for p in plan.get("existing_policies", [])[:6]:
+        _line(left, "\u2022 %s \u2014 %s  (%s)" % (p.get("name", ""), p.get("status", ""), p.get("source", "")), 10.5, before=2)
+    right = _box(s, 7.0, 1.2, 5.8, 5.7)
+    _first(right, "Key metrics (as reported)", 13, bold=True, color=ORANGE)
+    for met in plan.get("key_metrics", [])[:9]:
+        _line(right, "\u2022 %s: %s" % (met.get("name", ""), met.get("value", TOCONFIRM)), 10.5, before=3)
+        bm = met.get("benchmark", "")
+        _line(right, "benchmark: %s  (%s)" % (bm, met.get("source", "")), 8.5, color=GREY)
+    _footer(s, "Traceable to DD")
+
+    # 4-6 Phase detail
     for pkey, plabel in PHASES:
         items = [i for i in plan.get("initiatives", []) if i.get("phase") == pkey]
-        s = prs.slides.add_slide(blank)
-        _header_bar(s, prs, plabel)
-        body = s.shapes.add_textbox(Inches(0.6), Inches(1.25), Inches(12.1), Inches(5.9)).text_frame
-        body.word_wrap = True
+        s = _content(prs, plabel.replace("\u00b7", "\u2014"), "%d initiative(s) \u00b7 detailed actions, owners, milestones & KPIs" % len(items))
+        body = _box(s, 0.5, 1.15, 12.3, 5.9)
         if not items:
-            _txt(body, "No initiatives in this phase.", 14, color=HOLTARA_GREY)
+            _first(body, "No initiatives in this phase.", 12, color=GREY)
         else:
-            first = True
-            for i in items:
-                title = "%s   (%s · owner: %s · priority score %.1f)" % (
-                    i.get("title", ""), i.get("theme", ""), i.get("owner_role", "-"),
-                    i.get("composite_score", 0))
-                if first:
-                    _txt(body, title, 15, bold=True, color=PILLAR_COLOR.get(i.get("pillar"), HOLTARA_NAVY))
-                    first = False
+            shown = items[:4]
+            firstdone = False
+            for it in shown:
+                title = "%s   \u00b7   %s   \u00b7   priority %.1f" % (it.get("title", ""), it.get("owner_role", "-"), it.get("composite_score", 0))
+                if not firstdone:
+                    _first(body, title, 13, bold=True, color=PHASE_COLOR[pkey]); firstdone = True
                 else:
-                    _add_line(body, title, 15, bold=True, color=PILLAR_COLOR.get(i.get("pillar"), HOLTARA_NAVY))
-                detail = i.get("description", "")
-                if i.get("value_creation_eur"):
-                    detail += "   [Value %s | Invest %s]" % (eur(i.get("value_creation_eur")), eur(i.get("investment_eur")))
-                _add_line(body, detail, 12, color=HOLTARA_GREY)
+                    _line(body, title, 13, bold=True, color=PHASE_COLOR[pkey], before=10)
+                _line(body, it.get("objective", ""), 10.5, color=TEXT)
+                for a in it.get("activities", [])[:4]:
+                    _line(body, "\u2022 " + a, 10, color=TEXT, before=1, lvl=1)
+                kpi = it.get("recommended_kpi", {}) or {}
+                _line(body, "KPI: %s  |  baseline: %s  \u2192  target: %s" % (
+                    kpi.get("name", "-"), kpi.get("baseline", TOCONFIRM), kpi.get("target", "-")), 9.5, color=NAVY, before=2)
+                extra = []
+                if it.get("milestone"):
+                    extra.append("Milestone: " + it["milestone"])
+                if it.get("value_creation_eur"):
+                    extra.append("Value: +%s/yr" % eur(it.get("value_creation_eur")))
+                extra.append("source: %s" % it.get("source", "n/a"))
+                _line(body, "   ".join(extra), 8.5, color=GREY)
+            if len(items) > 4:
+                _line(body, "+ %d more initiative(s) in this phase (see JSON export)" % (len(items) - 4), 9.5, color=GREY, before=8)
+        _footer(s)
 
-    out = BytesIO()
-    prs.save(out)
-    return out.getvalue()
+    # 7 Targets & value story (ADVISE)
+    s = _content(prs, "Recommended targets & value story", "Holtara recommendations built on the DD findings")
+    body = _box(s, 0.5, 1.2, 12.3, 5.7)
+    _first(body, "Recommended targets by initiative", 13, bold=True, color=ORANGE)
+    for it in plan.get("initiatives", []):
+        kpi = it.get("recommended_kpi", {}) or {}
+        if kpi.get("target"):
+            _line(body, "\u2022 %s: %s \u2192 %s" % (it.get("title", ""), kpi.get("baseline", TOCONFIRM), kpi.get("target", "")), 10.5, before=2)
+    _line(body, "Assumptions behind these recommendations", 13, bold=True, color=ORANGE, before=12)
+    for a in plan.get("assumptions", []):
+        _line(body, "\u2022 " + a, 10.5, before=2)
+    _footer(s, "Recommendations")
+
+    # 8 Data gaps
+    s = _content(prs, "Data to confirm", "Not found in the DD \u2014 confirm before finalising (no numbers were invented)")
+    body = _box(s, 0.5, 1.2, 12.3, 5.7)
+    gaps = plan.get("data_gaps", [])
+    if not gaps:
+        _first(body, "No material data gaps identified.", 12, color=GREY)
+    else:
+        _first(body, "%d item(s) flagged as %s" % (len(gaps), TOCONFIRM), 12, bold=True, color=REDFLAG)
+        for g in gaps:
+            _line(body, "\u2022 " + g, 11, before=3)
+    _footer(s)
+
+    out = BytesIO(); prs.save(out); return out.getvalue()
 
 
-def board_pptx(company_name, narrative, metrics):
-    """Build a simple 2-slide board update deck and return it as bytes."""
-    prs = Presentation()
-    prs.slide_width = Inches(13.33)
-    prs.slide_height = Inches(7.5)
-    blank = prs.slide_layouts[6]
-    navy = RGBColor(0x1F, 0x2A, 0x6E)
-    orange = RGBColor(0xD9, 0x53, 0x1E)
-    eur = lambda v: "EUR {:,.0f}".format(v)
+# ----------------------------------------------------------- one-page summary
+def onepager_pptx(plan):
+    prs = Presentation(); prs.slide_width = Inches(13.33); prs.slide_height = Inches(7.5)
+    s = prs.slides.add_slide(prs.slide_layouts[6])
+    eur = lambda v: "EUR {:,.0f}".format(_num(v))
+    company = plan.get("company", {}).get("name", "Company"); m = plan.get("metrics", {})
+    head = _box(s, 0.5, 0.35, 9.5, 1.1)
+    _first(head, "100-Day ESG Value Creation Plan", 26, bold=True, color=ORANGE)
+    _line(head, "Driving positive change", 12, color=TEAL, italic=True)
+    _line(head, company, 13, color=NAVY)
+    _logo(s); _rect(s, 0.5, 1.55, 12.33, 0.03, ORANGE)
+    cards = [("Annual value creation", eur(m.get("total_value_creation_eur", 0)), ORANGE),
+             ("Investment", eur(m.get("total_investment_eur", 0)), NAVY),
+             ("Return on investment", "%sx" % m.get("roi_multiple", 0), ORANGE),
+             ("Initiatives", str(m.get("initiatives_total", 0)), NAVY)]
+    x = 0.5
+    for label, val, col in cards:
+        c = _box(s, x, 1.75, 3.05, 1.0); _first(c, val, 24, bold=True, color=col)
+        _line(c, label, 10.5, color=GREY); x += 3.07
+    _rect(s, 0.5, 2.85, 12.33, 0.02, RGBColor(0xDD, 0xDD, 0xDB))
+    for (pkey, plabel), cx in zip(PHASES, [0.5, 4.78, 9.06]):
+        _rect(s, cx, 3.02, 4.05, 0.42, PHASE_COLOR[pkey])
+        hb = _box(s, cx + 0.12, 3.05, 3.85, 0.4)
+        _first(hb, plabel.split("\u00b7")[0].strip(), 12, bold=True, color=WHITE)
+        items = [i for i in plan.get("initiatives", []) if i.get("phase") == pkey]
+        body = _box(s, cx + 0.05, 3.55, 4.0, 3.35)
+        _first(body, (plabel.split("\u00b7")[1].strip() if "\u00b7" in plabel else "").upper(), 8.5, bold=True, color=GREY)
+        for it in items[:6]:
+            money = "  \u00b7  +%s/yr" % eur(it.get("value_creation_eur")) if it.get("value_creation_eur") else ""
+            _line(body, "\u2022 " + it.get("title", ""), 10.5, bold=True, color=NAVY, before=6)
+            _line(body, "%s%s" % (it.get("owner_role", ""), money), 8.5, color=GREY)
+        if len(items) > 6:
+            _line(body, "+ %d more" % (len(items) - 6), 9, color=GREY, before=4)
+    _footer(s)
+    out = BytesIO(); prs.save(out); return out.getvalue()
 
-    # Slide 1 - title + metrics
-    s = prs.slides.add_slide(blank)
-    tb = s.shapes.add_textbox(Inches(0.6), Inches(0.5), Inches(12), Inches(1.2)).text_frame
-    tb.text = "100-Day ESG Value Creation Plan"
-    tb.paragraphs[0].runs[0].font.size = Pt(34)
-    tb.paragraphs[0].runs[0].font.bold = True
-    tb.paragraphs[0].runs[0].font.color.rgb = orange
-    p = tb.add_paragraph()
-    p.text = "%s  |  Board update  |  %s" % (company_name, date.today())
-    p.runs[0].font.size = Pt(16)
-    p.runs[0].font.color.rgb = navy
 
-    cards = [
-        ("Value creation / yr", eur(metrics["total_value_creation_eur"])),
-        ("Investment", eur(metrics["total_investment_eur"])),
-        ("ROI", "%sx" % metrics["roi_multiple"]),
-        ("Progress", "%d%% complete" % metrics["percent_complete"]),
-    ]
-    x = 0.6
-    for label, value in cards:
-        box = s.shapes.add_textbox(Inches(x), Inches(2.0), Inches(2.9), Inches(1.3)).text_frame
-        box.word_wrap = True
-        box.text = value
-        box.paragraphs[0].runs[0].font.size = Pt(26)
-        box.paragraphs[0].runs[0].font.bold = True
-        box.paragraphs[0].runs[0].font.color.rgb = navy
-        lp = box.add_paragraph()
-        lp.text = label
-        lp.runs[0].font.size = Pt(13)
-        x += 3.05
+# ----------------------------------------------------------- FINDINGS one-pager
+def findings_onepager_pptx(plan):
+    """Single branded slide summarising the EXTRACTED DD findings."""
+    prs = Presentation(); prs.slide_width = Inches(13.33); prs.slide_height = Inches(7.5)
+    s = prs.slides.add_slide(prs.slide_layouts[6])
+    eur = lambda v: "EUR {:,.0f}".format(_num(v))
+    company = plan.get("company", {}).get("name", "Company")
+    m = plan.get("metrics", {}); ov = plan.get("overall", {})
+    themes = plan.get("themes", []); gaps = plan.get("data_gaps", [])
 
-    sb = s.shapes.add_textbox(Inches(0.6), Inches(3.6), Inches(12.1), Inches(3.4)).text_frame
-    sb.word_wrap = True
-    sb.text = "Executive summary"
-    sb.paragraphs[0].runs[0].font.size = Pt(18)
-    sb.paragraphs[0].runs[0].font.bold = True
-    ep = sb.add_paragraph()
-    ep.text = narrative.get("executive_summary", "")
-    ep.runs[0].font.size = Pt(14)
+    head = _box(s, 0.5, 0.35, 9.5, 1.1)
+    _first(head, "ESG Due Diligence \u2014 Findings", 26, bold=True, color=ORANGE)
+    _line(head, "Driving positive change", 12, color=TEAL, italic=True)
+    _line(head, company, 13, color=NAVY)
+    _logo(s); _rect(s, 0.5, 1.55, 12.33, 0.03, ORANGE)
 
-    # Slide 2 - progress by phase
-    s2 = prs.slides.add_slide(blank)
-    t2 = s2.shapes.add_textbox(Inches(0.6), Inches(0.4), Inches(12), Inches(0.8)).text_frame
-    t2.text = "Progress by phase"
-    t2.paragraphs[0].runs[0].font.size = Pt(26)
-    t2.paragraphs[0].runs[0].font.bold = True
-    t2.paragraphs[0].runs[0].font.color.rgb = orange
-    body = s2.shapes.add_textbox(Inches(0.6), Inches(1.3), Inches(12.1), Inches(5.6)).text_frame
-    body.word_wrap = True
-    first = True
-    for ph in narrative.get("phases", []):
-        para = body.paragraphs[0] if first else body.add_paragraph()
-        first = False
-        para.text = "%s  -  %s" % (ph.get("phase", ""), ph.get("status", ""))
-        para.runs[0].font.size = Pt(16)
-        para.runs[0].font.bold = True
-        para.runs[0].font.color.rgb = navy
+    # verdict + headline cards (from the DD)
+    abstain = ov.get("abstain_from_deal", TOCONFIRM)
+    cards = [("Value-creation opportunity", eur(m.get("total_value_creation_eur", 0)), ORANGE),
+             ("Investment indicated", eur(m.get("total_investment_eur", 0)), NAVY),
+             ("Material themes", str(len(themes)), ORANGE),
+             ("Abstain from deal?", abstain, REDFLAG if str(abstain).lower().startswith("y") else NAVY)]
+    x = 0.5
+    for label, val, col in cards:
+        c = _box(s, x, 1.72, 3.05, 0.95); _first(c, val, 22, bold=True, color=col)
+        _line(c, label, 10, color=GREY); x += 3.07
+
+    vd = _box(s, 0.5, 2.7, 12.3, 0.5)
+    _first(vd, "Overall verdict: %s   (source: %s)" % (ov.get("headline", TOCONFIRM), ov.get("source", "n/a")), 11, color=TEXT, italic=True)
+    _rect(s, 0.5, 3.18, 12.33, 0.02, RGBColor(0xDD, 0xDD, 0xDB))
+
+    # findings grid (2 columns)
+    _box(s, 0.5, 3.24, 6, 0.3) and _first(_box(s, 0.5, 3.24, 8, 0.3), "Material ESG findings (extracted from the DD)", 11, bold=True, color=GREY)
+    cols_x = [0.5, 6.85]
+    for idx, t in enumerate(themes[:6]):
+        col, row = idx % 2, idx // 2
+        cx = cols_x[col]; cy = 3.6 + row * 1.18
+        pc = PILLAR_COLOR.get(t.get("pillar"), NAVY)
+        _rect(s, cx, cy, 0.08, 1.02, pc)
+        tb = _box(s, cx + 0.18, cy - 0.02, 5.75, 1.12)
+        _first(tb, "%s \u00b7 %s   (%s)" % (t.get("code", ""), t.get("name", ""), t.get("maturity", TOCONFIRM)), 11, bold=True, color=pc)
+        fnd = t.get("finding", "")
+        _line(tb, fnd if len(fnd) < 165 else fnd[:162] + "...", 9.5, color=TEXT)
+        _line(tb, "source: %s" % t.get("source", "n/a"), 8, color=GREY)
+    if len(themes) > 6:
+        _first(_box(s, 0.5, 6.75, 6, 0.3), "+ %d more theme(s) in the detailed plan" % (len(themes) - 6), 9, color=GREY)
+
+    note = "Data to confirm: %d item(s) not in the DD \u2014 see detailed plan." % len(gaps) if gaps else ""
+    _footer(s, note)
+    out = BytesIO(); prs.save(out); return out.getvalue()
+
+
+# ----------------------------------------------------------- board update
+def board_markdown(company_name, n, m):
+    eur = lambda v: "EUR {:,.0f}".format(_num(v))
+    L = ["# 100-Day ESG Value Creation Plan - Board Update",
+         "**Company:** %s  |  **Date:** %s" % (company_name, date.today()), "",
+         "## Executive summary", n.get("executive_summary", ""), "", "## Key metrics",
+         "- Annual value creation: **%s**" % eur(m["total_value_creation_eur"]),
+         "- Investment: **%s**" % eur(m["total_investment_eur"]),
+         "- ROI: **%sx**" % m["roi_multiple"],
+         "- Initiatives: **%d total, %d complete (%d%%)**" % (m["initiatives_total"], m["initiatives_complete"], m["percent_complete"]),
+         "", "## Progress by phase"]
+    for ph in n.get("phases", []):
+        L.append("**%s - %s**" % (ph.get("phase", ""), ph.get("status", "")))
+        L += ["- %s" % h for h in ph.get("highlights", [])]; L.append("")
+    L.append("## Top priorities"); L += ["- %s" % p for p in n.get("top_priorities", [])]
+    L.append(""); L.append("## Risks & asks"); L += ["- %s" % r for r in n.get("risks_and_asks", [])]
+    return "\n".join(L)
+
+
+def board_pptx(company_name, n, m):
+    prs = Presentation(); prs.slide_width = Inches(13.33); prs.slide_height = Inches(7.5)
+    s = _content(prs, "Board update \u2014 100-Day ESG Plan", "%s  \u00b7  %s" % (company_name, date.today()))
+    eur = lambda v: "EUR {:,.0f}".format(_num(v))
+    cards = [("Value / yr", eur(m["total_value_creation_eur"]), ORANGE), ("Investment", eur(m["total_investment_eur"]), NAVY),
+             ("ROI", "%sx" % m["roi_multiple"], ORANGE), ("Progress", "%d%%" % m["percent_complete"], NAVY)]
+    x = 0.5
+    for label, val, col in cards:
+        c = _box(s, x, 1.2, 3.05, 1.0); _first(c, val, 22, bold=True, color=col); _line(c, label, 10.5, color=GREY); x += 3.07
+    body = _box(s, 0.5, 2.4, 12.3, 4.4)
+    _first(body, "Executive summary", 13, bold=True, color=NAVY)
+    _line(body, n.get("executive_summary", ""), 12)
+    for ph in n.get("phases", []):
+        _line(body, "%s  -  %s" % (ph.get("phase", ""), ph.get("status", "")), 12, bold=True, color=NAVY, before=8)
         for h in ph.get("highlights", []):
-            hp = body.add_paragraph()
-            hp.text = "  -  %s" % h
-            hp.runs[0].font.size = Pt(13)
-
-    out = BytesIO()
-    prs.save(out)
-    return out.getvalue()
+            _line(body, "\u2022 " + h, 11, before=1)
+    _footer(s)
+    out = BytesIO(); prs.save(out); return out.getvalue()
