@@ -249,6 +249,126 @@ def board_markdown(company_name, narrative, metrics):
     return "\n".join(lines)
 
 
+# ----------------------------------------------------------- Holtara branding
+# Colours + font taken from the Holtara DD template. To use exact brand hex
+# codes, just change these four lines.
+HOLTARA_NAVY = RGBColor(0x0E, 0x28, 0x41)
+HOLTARA_BLUE = RGBColor(0x15, 0x60, 0x82)
+HOLTARA_ORANGE = RGBColor(0xE9, 0x71, 0x32)
+HOLTARA_GREY = RGBColor(0x55, 0x55, 0x55)
+HOLTARA_FONT = "Aptos"
+PILLAR_COLOR = {"E": RGBColor(0x19, 0x6B, 0x24), "S": HOLTARA_BLUE, "G": RGBColor(0xA0, 0x2B, 0x93)}
+
+
+def _txt(frame, text, size, *, bold=False, color=None, font=HOLTARA_FONT):
+    frame.text = text
+    r = frame.paragraphs[0].runs[0]
+    r.font.size = Pt(size)
+    r.font.bold = bold
+    r.font.name = font
+    if color is not None:
+        r.font.color.rgb = color
+    return frame
+
+
+def _add_line(frame, text, size, *, bold=False, color=None, font=HOLTARA_FONT):
+    p = frame.add_paragraph()
+    p.text = text
+    r = p.runs[0]
+    r.font.size = Pt(size)
+    r.font.bold = bold
+    r.font.name = font
+    if color is not None:
+        r.font.color.rgb = color
+    return p
+
+
+def _header_bar(slide, prs, title):
+    """Navy header bar with white title + orange tagline."""
+    bar = slide.shapes.add_shape(1, Inches(0), Inches(0), prs.slide_width, Inches(1.0))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = HOLTARA_NAVY
+    bar.line.fill.background()
+    tf = bar.text_frame
+    tf.margin_left = Inches(0.6)
+    _txt(tf, title, 26, bold=True, color=RGBColor(0xFF, 0xFF, 0xFF))
+
+
+def branded_plan_pptx(plan):
+    """Render the full 100-day plan as a polished, Holtara-branded deck."""
+    prs = Presentation()
+    prs.slide_width = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+    blank = prs.slide_layouts[6]
+    eur = lambda v: "EUR {:,.0f}".format(_num(v))
+    company = plan.get("company", {}).get("name", "Company")
+    metrics = plan.get("metrics", {})
+
+    # ---- Title slide
+    s = prs.slides.add_slide(blank)
+    band = s.shapes.add_shape(1, Inches(0), Inches(2.4), prs.slide_width, Inches(2.7))
+    band.fill.solid(); band.fill.fore_color.rgb = HOLTARA_NAVY; band.line.fill.background()
+    box = s.shapes.add_textbox(Inches(0.7), Inches(2.7), Inches(12), Inches(2.0)).text_frame
+    _txt(box, "100-Day ESG Value Creation Plan", 40, bold=True, color=RGBColor(0xFF, 0xFF, 0xFF))
+    _add_line(box, company, 22, color=HOLTARA_ORANGE)
+    _add_line(box, "Driving positive change", 14, color=RGBColor(0xE8, 0xE8, 0xE8))
+    foot = s.shapes.add_textbox(Inches(0.7), Inches(6.9), Inches(12), Inches(0.4)).text_frame
+    _txt(foot, "Holtara  |  %s  |  Strictly private & confidential" % date.today(), 11, color=HOLTARA_GREY)
+
+    # ---- Summary slide with metric cards
+    s = prs.slides.add_slide(blank)
+    _header_bar(s, prs, "Executive summary")
+    cards = [
+        ("Annual value creation", eur(metrics.get("total_value_creation_eur", 0))),
+        ("Investment", eur(metrics.get("total_investment_eur", 0))),
+        ("Return on investment", "%sx" % metrics.get("roi_multiple", 0)),
+        ("Initiatives", str(metrics.get("initiatives_total", 0))),
+    ]
+    x = 0.6
+    for label, value in cards:
+        card = s.shapes.add_shape(1, Inches(x), Inches(1.4), Inches(2.95), Inches(1.5))
+        card.fill.solid(); card.fill.fore_color.rgb = RGBColor(0xF2, 0xF5, 0xF8)
+        card.line.color.rgb = HOLTARA_BLUE; card.line.width = Pt(1)
+        tf = card.text_frame; tf.margin_left = Inches(0.2); tf.margin_top = Inches(0.2)
+        _txt(tf, value, 24, bold=True, color=HOLTARA_NAVY)
+        _add_line(tf, label, 12, color=HOLTARA_GREY)
+        x += 3.07
+    verdict = plan.get("overall", {}).get("headline", "")
+    vb = s.shapes.add_textbox(Inches(0.6), Inches(3.4), Inches(12.1), Inches(3.4)).text_frame
+    vb.word_wrap = True
+    _txt(vb, "Overall ESG verdict", 16, bold=True, color=HOLTARA_NAVY)
+    _add_line(vb, verdict, 14, color=RGBColor(0x33, 0x33, 0x33))
+
+    # ---- One slide per phase
+    for pkey, plabel in PHASES:
+        items = [i for i in plan.get("initiatives", []) if i.get("phase") == pkey]
+        s = prs.slides.add_slide(blank)
+        _header_bar(s, prs, plabel)
+        body = s.shapes.add_textbox(Inches(0.6), Inches(1.25), Inches(12.1), Inches(5.9)).text_frame
+        body.word_wrap = True
+        if not items:
+            _txt(body, "No initiatives in this phase.", 14, color=HOLTARA_GREY)
+        else:
+            first = True
+            for i in items:
+                title = "%s   (%s · owner: %s · priority score %.1f)" % (
+                    i.get("title", ""), i.get("theme", ""), i.get("owner_role", "-"),
+                    i.get("composite_score", 0))
+                if first:
+                    _txt(body, title, 15, bold=True, color=PILLAR_COLOR.get(i.get("pillar"), HOLTARA_NAVY))
+                    first = False
+                else:
+                    _add_line(body, title, 15, bold=True, color=PILLAR_COLOR.get(i.get("pillar"), HOLTARA_NAVY))
+                detail = i.get("description", "")
+                if i.get("value_creation_eur"):
+                    detail += "   [Value %s | Invest %s]" % (eur(i.get("value_creation_eur")), eur(i.get("investment_eur")))
+                _add_line(body, detail, 12, color=HOLTARA_GREY)
+
+    out = BytesIO()
+    prs.save(out)
+    return out.getvalue()
+
+
 def board_pptx(company_name, narrative, metrics):
     """Build a simple 2-slide board update deck and return it as bytes."""
     prs = Presentation()
